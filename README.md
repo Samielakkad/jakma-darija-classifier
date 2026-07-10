@@ -125,7 +125,7 @@ This classifier was developed using the **5-dimension evaluation rubric** from t
 
 1. **Tangier and Agadir are weak** — fewer than 200 training examples each, F1 drops to ~0.78 on these cities. On roadmap to fix via active sampling.
 2. **Handyman / "shi haja" queries** — the model deliberately routes ambiguous queries to `confidence: low` rather than guessing. This is by design (it pairs with a verifier downstream) but means raw accuracy on the "general repair" intent class looks artificially low.
-3. **Salé / Rabat adjacency** — these two cities are 5km apart across a river and the model can flip between them on commuter queries. An adjacency post-processor handles this in production (see [jak-ma-eval-suite/adjacency.py](https://github.com/Samielakkad/AI-LLM-Evaluation-JakMa)).
+3. **Salé / Rabat adjacency** — these two cities are 5km apart across a river and the model can flip between them on commuter queries. An adjacency post-processor handles this in production (see [jak-ma-eval-suite](https://github.com/Samielakkad/AI-LLM-Evaluation-JakMa)).
 4. **Concept drift** — pricing-sensitive trade labels (e.g. AC technician) drift seasonally. Model is retrained quarterly. Last retrain: May 2026.
 5. **Not a chat model** — this is *classification only*. The Darija chat experience uses this as Pass 1, with a separate Pass 2 generator + verifier.
 
