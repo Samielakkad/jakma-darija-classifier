@@ -79,14 +79,35 @@ This is **Pass 1** of jak.ma's two-pass architecture. Pass 2 (generation + verif
 ## How it's used in production
 
 ```python
-from transformers import pipeline
+from handler import EndpointHandler
 
-clf = pipeline("text-classification", model="samielakkad1/jakma-darija-classifier")
-out = clf("بغيت plombier f Casa daba")
-# → [{"label": "plumber/Casablanca", "score": 0.94}]
+clf = EndpointHandler("/path/to/model-artifacts")
+out = clf({"inputs": "بغيت plombier f Casa daba"})
+# → [{"trade": "plumber", "city": "Casablanca", "confidence": "high", ...}]
 ```
 
 In jak.ma production this is wrapped with a verifier (see [jak-ma-eval-suite/VERIFIER_SPEC.md](https://github.com/Samielakkad/AI-LLM-Evaluation-JakMa/blob/main/VERIFIER_SPEC.md)) — if `score < 0.6`, the system asks a clarifying question instead of routing.
+
+### Inference artifact contract
+
+The model directory passed to `EndpointHandler` must contain:
+
+- `config.json`, including `hidden_size`, each `num_labels_*` count, and contiguous `id2label_*` mappings.
+- `heads.pt`, saved as the state dict of a `torch.nn.ModuleDict` with `trade`, `city`, and `confidence` linear heads.
+- The tokenizer and XLM-R encoder artifacts expected by `AutoTokenizer.from_pretrained` and `AutoModel.from_pretrained`.
+
+The handler validates label IDs, label counts, encoder width, checkpoint keys, and every checkpoint tensor shape before serving traffic. `heads.pt` is loaded on CPU with restricted tensor-only deserialization and is moved to the inference device only after validation. A missing or incompatible artifact is a startup error; the handler never substitutes randomly initialized heads.
+
+`inputs` accepts either one non-empty string or a non-empty list of non-empty strings. Batch requests use one padded encoder pass and return one prediction object per input, in the same order. Invalid input types and blank strings raise an explicit `TypeError` or `ValueError`.
+
+## Development checks
+
+The unit tests exercise artifact validation and batched inference without downloading model weights:
+
+```bash
+python -m unittest discover -s tests -v
+python -m compileall -q handler.py tests
+```
 
 ## Dataset
 

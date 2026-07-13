@@ -4,40 +4,116 @@ jakma-darija-classifier · Pass-1 inference handler
 Wraps a base xlm-roberta-base model with the jak.ma trade × city × confidence
 heads. Designed for Hugging Face Inference Endpoints + Spaces.
 """
-from collections.abc import Mapping
-from typing import Any, Dict, List
+import json
 import os
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, Dict, List
 
-# Base model — published weights are a thin policy + tokenizer extension.
-# Full LoRA-tuned weights for the classification heads are released alongside.
-BASE_MODEL = "xlm-roberta-base"
-
-TRADES = [
-    "plumber", "electrician", "tiler", "painter", "carpenter", "mason",
-    "mechanic", "electronics", "ac_technician", "gardener", "cleaner", "mover",
-]
-CITIES = [
-    "Casablanca", "Rabat", "Sale", "Tangier", "Marrakesh", "Agadir", "Fes",
-    "Meknes", "Oujda", "Kenitra", "Tetouan", "Nador", "Beni Mellal",
-    "El Jadida", "Mohammedia",
-]
-CONFIDENCE = ["low", "medium", "high"]
+CONFIG_FILENAME = "config.json"
 HEADS_FILENAME = "heads.pt"
+HEAD_NAMES = ("trade", "city", "confidence")
 
 
-def _expected_head_shapes(hidden_size: int) -> Dict[str, tuple[int, ...]]:
+@dataclass(frozen=True)
+class ClassifierConfig:
+    hidden_size: int
+    trade_labels: tuple[str, ...]
+    city_labels: tuple[str, ...]
+    confidence_labels: tuple[str, ...]
+
+    def labels_for(self, head_name: str) -> tuple[str, ...]:
+        if head_name not in HEAD_NAMES:
+            raise KeyError(f"unknown classifier head: {head_name}")
+        return getattr(self, f"{head_name}_labels")
+
+
+def _read_positive_int(raw_config: Mapping[str, Any], key: str) -> int:
+    value = raw_config.get(key)
+    if type(value) is not int or value <= 0:
+        raise ValueError(f"config field {key!r} must be a positive integer")
+    return value
+
+
+def _read_labels(raw_config: Mapping[str, Any], head_name: str) -> tuple[str, ...]:
+    count_key = f"num_labels_{head_name}"
+    labels_key = f"id2label_{head_name}"
+    label_count = _read_positive_int(raw_config, count_key)
+    id_to_label = raw_config.get(labels_key)
+    if not isinstance(id_to_label, Mapping):
+        raise ValueError(f"config field {labels_key!r} must be an ID-to-label mapping")
+
+    expected_ids = {str(index) for index in range(label_count)}
+    actual_ids = set(id_to_label)
+    if actual_ids != expected_ids:
+        missing = sorted(expected_ids - actual_ids)
+        unexpected = sorted(actual_ids - expected_ids)
+        raise ValueError(
+            f"config field {labels_key!r} must contain contiguous IDs 0..{label_count - 1} "
+            f"(missing={missing}, unexpected={unexpected})"
+        )
+
+    labels = tuple(id_to_label[str(index)] for index in range(label_count))
+    for index, label in enumerate(labels):
+        if not isinstance(label, str) or not label.strip():
+            raise ValueError(f"config field {labels_key!r}[{index}] must be a non-empty string")
+    if len(set(labels)) != len(labels):
+        raise ValueError(f"config field {labels_key!r} must not contain duplicate labels")
+    return labels
+
+
+def _load_classifier_config(model_path: str) -> ClassifierConfig:
+    if not model_path:
+        raise ValueError("model path is required to load classifier configuration")
+
+    config_path = os.path.join(model_path, CONFIG_FILENAME)
+    if not os.path.isfile(config_path):
+        raise FileNotFoundError(
+            f"classifier configuration is missing: expected {config_path}"
+        )
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            raw_config = json.load(config_file)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"failed to load classifier configuration from {config_path}") from exc
+
+    if not isinstance(raw_config, Mapping):
+        raise ValueError("config.json must contain a JSON object")
+
+    return ClassifierConfig(
+        hidden_size=_read_positive_int(raw_config, "hidden_size"),
+        trade_labels=_read_labels(raw_config, "trade"),
+        city_labels=_read_labels(raw_config, "city"),
+        confidence_labels=_read_labels(raw_config, "confidence"),
+    )
+
+
+def _expected_head_shapes(config: ClassifierConfig) -> Dict[str, tuple[int, ...]]:
     """Return the only state-dict shape accepted by this handler."""
-    return {
-        "trade.weight": (len(TRADES), hidden_size),
-        "trade.bias": (len(TRADES),),
-        "city.weight": (len(CITIES), hidden_size),
-        "city.bias": (len(CITIES),),
-        "confidence.weight": (len(CONFIDENCE), hidden_size),
-        "confidence.bias": (len(CONFIDENCE),),
-    }
+    shapes = {}
+    for head_name in HEAD_NAMES:
+        label_count = len(config.labels_for(head_name))
+        shapes[f"{head_name}.weight"] = (label_count, config.hidden_size)
+        shapes[f"{head_name}.bias"] = (label_count,)
+    return shapes
 
 
-def _load_heads(torch: Any, model_path: str, hidden_size: int, device: str) -> Any:
+def _validate_encoder_hidden_size(config: ClassifierConfig, actual_hidden_size: Any) -> None:
+    if type(actual_hidden_size) is not int or actual_hidden_size <= 0:
+        raise ValueError("encoder hidden_size must be a positive integer")
+    if actual_hidden_size != config.hidden_size:
+        raise ValueError(
+            "encoder hidden_size does not match config.json "
+            f"(encoder={actual_hidden_size}, config={config.hidden_size})"
+        )
+
+
+def _load_heads(
+    torch: Any,
+    model_path: str,
+    config: ClassifierConfig,
+    device: str,
+) -> Any:
     """Load a complete, tensor-only classification-head state dict."""
     if not model_path:
         raise ValueError("model path is required to load trained classification heads")
@@ -60,7 +136,7 @@ def _load_heads(torch: Any, model_path: str, hidden_size: int, device: str) -> A
     if not isinstance(state_dict, Mapping):
         raise ValueError("heads.pt must contain a state dict mapping parameter names to tensors")
 
-    expected_shapes = _expected_head_shapes(hidden_size)
+    expected_shapes = _expected_head_shapes(config)
     actual_keys = set(state_dict)
     expected_keys = set(expected_shapes)
     if actual_keys != expected_keys:
@@ -83,9 +159,11 @@ def _load_heads(torch: Any, model_path: str, hidden_size: int, device: str) -> A
             )
 
     heads = torch.nn.ModuleDict({
-        "trade": torch.nn.Linear(hidden_size, len(TRADES)),
-        "city": torch.nn.Linear(hidden_size, len(CITIES)),
-        "confidence": torch.nn.Linear(hidden_size, len(CONFIDENCE)),
+        head_name: torch.nn.Linear(
+            config.hidden_size,
+            len(config.labels_for(head_name)),
+        )
+        for head_name in HEAD_NAMES
     })
     heads.load_state_dict(state_dict, strict=True)
     return heads.to(device).eval()
@@ -126,18 +204,25 @@ class EndpointHandler:
     """
 
     def __init__(self, path: str = ""):
-        from transformers import AutoTokenizer, AutoModel
+        self.classifier_config = _load_classifier_config(path)
+
         import torch
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        self.tokenizer = AutoTokenizer.from_pretrained(path or BASE_MODEL)
-        self.base = AutoModel.from_pretrained(path or BASE_MODEL).to(self.device).eval()
-
         self.heads = _load_heads(
             torch=torch,
             model_path=path,
-            hidden_size=self.base.config.hidden_size,
+            config=self.classifier_config,
             device=self.device,
+        )
+
+        from transformers import AutoModel, AutoTokenizer
+
+        self.tokenizer = AutoTokenizer.from_pretrained(path)
+        self.base = AutoModel.from_pretrained(path).to(self.device).eval()
+        _validate_encoder_hidden_size(
+            self.classifier_config,
+            self.base.config.hidden_size,
         )
 
     def __call__(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -189,9 +274,9 @@ class EndpointHandler:
             conf_idx = int(conf_probs[row].argmax().item())
 
             predictions.append({
-                "trade": TRADES[trade_idx],
-                "city": CITIES[city_idx],
-                "confidence": CONFIDENCE[conf_idx],
+                "trade": self.classifier_config.trade_labels[trade_idx],
+                "city": self.classifier_config.city_labels[city_idx],
+                "confidence": self.classifier_config.confidence_labels[conf_idx],
                 "scores": {
                     "trade": float(trade_probs[row, trade_idx].item()),
                     "city": float(city_probs[row, city_idx].item()),
