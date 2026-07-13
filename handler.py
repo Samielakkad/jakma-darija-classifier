@@ -4,8 +4,8 @@ jakma-darija-classifier · Pass-1 inference handler
 Wraps a base xlm-roberta-base model with the jak.ma trade × city × confidence
 heads. Designed for Hugging Face Inference Endpoints + Spaces.
 """
-from typing import Dict, Any, List
-import json
+from collections.abc import Mapping
+from typing import Any, Dict, List
 import os
 
 # Base model — published weights are a thin policy + tokenizer extension.
@@ -22,6 +22,73 @@ CITIES = [
     "El Jadida", "Mohammedia",
 ]
 CONFIDENCE = ["low", "medium", "high"]
+HEADS_FILENAME = "heads.pt"
+
+
+def _expected_head_shapes(hidden_size: int) -> Dict[str, tuple[int, ...]]:
+    """Return the only state-dict shape accepted by this handler."""
+    return {
+        "trade.weight": (len(TRADES), hidden_size),
+        "trade.bias": (len(TRADES),),
+        "city.weight": (len(CITIES), hidden_size),
+        "city.bias": (len(CITIES),),
+        "confidence.weight": (len(CONFIDENCE), hidden_size),
+        "confidence.bias": (len(CONFIDENCE),),
+    }
+
+
+def _load_heads(torch: Any, model_path: str, hidden_size: int, device: str) -> Any:
+    """Load a complete, tensor-only classification-head state dict."""
+    if not model_path:
+        raise ValueError("model path is required to load trained classification heads")
+
+    heads_path = os.path.join(model_path, HEADS_FILENAME)
+    if not os.path.isfile(heads_path):
+        raise FileNotFoundError(
+            f"trained classification heads are missing: expected {heads_path}"
+        )
+
+    try:
+        state_dict = torch.load(
+            heads_path,
+            map_location="cpu",
+            weights_only=True,
+        )
+    except Exception as exc:
+        raise RuntimeError(f"failed to load trained heads from {heads_path}") from exc
+
+    if not isinstance(state_dict, Mapping):
+        raise ValueError("heads.pt must contain a state dict mapping parameter names to tensors")
+
+    expected_shapes = _expected_head_shapes(hidden_size)
+    actual_keys = set(state_dict)
+    expected_keys = set(expected_shapes)
+    if actual_keys != expected_keys:
+        missing = sorted(expected_keys - actual_keys)
+        unexpected = sorted(actual_keys - expected_keys)
+        raise ValueError(
+            "heads.pt parameter keys do not match the classifier architecture "
+            f"(missing={missing}, unexpected={unexpected})"
+        )
+
+    for name, expected_shape in expected_shapes.items():
+        tensor = state_dict[name]
+        if not torch.is_tensor(tensor):
+            raise ValueError(f"heads.pt parameter {name!r} is not a tensor")
+        actual_shape = tuple(tensor.shape)
+        if actual_shape != expected_shape:
+            raise ValueError(
+                f"heads.pt parameter {name!r} has shape {actual_shape}; "
+                f"expected {expected_shape}"
+            )
+
+    heads = torch.nn.ModuleDict({
+        "trade": torch.nn.Linear(hidden_size, len(TRADES)),
+        "city": torch.nn.Linear(hidden_size, len(CITIES)),
+        "confidence": torch.nn.Linear(hidden_size, len(CONFIDENCE)),
+    })
+    heads.load_state_dict(state_dict, strict=True)
+    return heads.to(device).eval()
 
 
 class EndpointHandler:
@@ -40,17 +107,12 @@ class EndpointHandler:
         self.tokenizer = AutoTokenizer.from_pretrained(path or BASE_MODEL)
         self.base = AutoModel.from_pretrained(path or BASE_MODEL).to(self.device).eval()
 
-        # Classification heads (loaded from heads.pt if present, else random init).
-        heads_path = os.path.join(path, "heads.pt") if path else None
-        if heads_path and os.path.exists(heads_path):
-            self.heads = torch.load(heads_path, map_location=self.device)
-        else:
-            hidden = self.base.config.hidden_size
-            self.heads = {
-                "trade": torch.nn.Linear(hidden, len(TRADES)).to(self.device),
-                "city": torch.nn.Linear(hidden, len(CITIES)).to(self.device),
-                "confidence": torch.nn.Linear(hidden, len(CONFIDENCE)).to(self.device),
-            }
+        self.heads = _load_heads(
+            torch=torch,
+            model_path=path,
+            hidden_size=self.base.config.hidden_size,
+            device=self.device,
+        )
 
     def __call__(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
