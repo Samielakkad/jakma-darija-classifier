@@ -91,6 +91,32 @@ def _load_heads(torch: Any, model_path: str, hidden_size: int, device: str) -> A
     return heads.to(device).eval()
 
 
+def _validate_inputs(data: Any) -> List[str]:
+    """Normalize one string or a batch of strings into a non-empty batch."""
+    if not isinstance(data, Mapping):
+        raise TypeError("request body must be a mapping with an 'inputs' field")
+    if "inputs" not in data:
+        raise ValueError("request body must include an 'inputs' field")
+
+    inputs = data["inputs"]
+    if isinstance(inputs, str):
+        texts = [inputs]
+    elif isinstance(inputs, list):
+        if not inputs:
+            raise ValueError("'inputs' batch must contain at least one string")
+        texts = inputs
+    else:
+        raise TypeError("'inputs' must be a string or a list of strings")
+
+    for index, text in enumerate(texts):
+        if not isinstance(text, str):
+            raise TypeError(f"'inputs[{index}]' must be a string")
+        if not text.strip():
+            raise ValueError(f"'inputs[{index}]' must not be empty or whitespace")
+
+    return texts
+
+
 class EndpointHandler:
     """
     Hugging Face Inference Endpoints / Spaces handler.
@@ -116,10 +142,11 @@ class EndpointHandler:
 
     def __call__(self, data: Dict[str, Any]) -> List[Dict[str, Any]]:
         """
-        Single inference call.
+        Single or batch inference call.
 
         Input format:
             {"inputs": "بغيت plombier f Casa daba"}
+            {"inputs": ["بغيت plombier", "Need an electrician in Rabat"]}
 
         Output format:
             [{
@@ -133,12 +160,14 @@ class EndpointHandler:
         """
         import torch
 
-        text = data.get("inputs", "")
-        if isinstance(text, list):
-            text = text[0] if text else ""
+        texts = _validate_inputs(data)
 
         toks = self.tokenizer(
-            text, return_tensors="pt", truncation=True, max_length=128,
+            texts,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=128,
         ).to(self.device)
 
         with torch.no_grad():
@@ -149,21 +178,25 @@ class EndpointHandler:
             city_logits = self.heads["city"](pooled)
             conf_logits = self.heads["confidence"](pooled)
 
-            trade_probs = torch.softmax(trade_logits, dim=-1).squeeze()
-            city_probs = torch.softmax(city_logits, dim=-1).squeeze()
-            conf_probs = torch.softmax(conf_logits, dim=-1).squeeze()
+            trade_probs = torch.softmax(trade_logits, dim=-1)
+            city_probs = torch.softmax(city_logits, dim=-1)
+            conf_probs = torch.softmax(conf_logits, dim=-1)
 
-            trade_idx = int(trade_probs.argmax())
-            city_idx = int(city_probs.argmax())
-            conf_idx = int(conf_probs.argmax())
+        predictions = []
+        for row in range(len(texts)):
+            trade_idx = int(trade_probs[row].argmax().item())
+            city_idx = int(city_probs[row].argmax().item())
+            conf_idx = int(conf_probs[row].argmax().item())
 
-        return [{
-            "trade": TRADES[trade_idx],
-            "city": CITIES[city_idx],
-            "confidence": CONFIDENCE[conf_idx],
-            "scores": {
-                "trade": float(trade_probs[trade_idx]),
-                "city": float(city_probs[city_idx]),
-                "confidence": float(conf_probs[conf_idx]),
-            },
-        }]
+            predictions.append({
+                "trade": TRADES[trade_idx],
+                "city": CITIES[city_idx],
+                "confidence": CONFIDENCE[conf_idx],
+                "scores": {
+                    "trade": float(trade_probs[row, trade_idx].item()),
+                    "city": float(city_probs[row, city_idx].item()),
+                    "confidence": float(conf_probs[row, conf_idx].item()),
+                },
+            })
+
+        return predictions
