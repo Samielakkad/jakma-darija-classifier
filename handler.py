@@ -57,6 +57,7 @@ def _read_labels(raw_config: Mapping[str, Any], head_name: str) -> tuple[str, ..
     for index, label in enumerate(labels):
         if not isinstance(label, str) or not label.strip():
             raise ValueError(f"config field {labels_key!r}[{index}] must be a non-empty string")
+    labels = tuple(label.strip() for label in labels)
     if len(set(labels)) != len(labels):
         raise ValueError(f"config field {labels_key!r} must not contain duplicate labels")
     return labels
