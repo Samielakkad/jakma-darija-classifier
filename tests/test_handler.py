@@ -313,6 +313,22 @@ class ClassifierConfigTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     _load_classifier_config(model_path)
 
+    def test_labels_are_stripped_before_duplicate_validation(self):
+        raw_config = valid_raw_config()
+        raw_config["id2label_trade"]["0"] = " plumber "
+
+        with tempfile.TemporaryDirectory() as model_path:
+            write_config(model_path, raw_config)
+            config = _load_classifier_config(model_path)
+
+        self.assertEqual(config.trade_labels[0], "plumber")
+
+        raw_config["id2label_trade"]["1"] = "plumber"
+        with tempfile.TemporaryDirectory() as model_path:
+            write_config(model_path, raw_config)
+            with self.assertRaisesRegex(ValueError, "duplicate labels"):
+                _load_classifier_config(model_path)
+
     def test_head_shapes_come_from_config(self):
         self.assertEqual(
             _expected_head_shapes(TEST_CONFIG),
